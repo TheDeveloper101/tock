@@ -12,35 +12,37 @@
 //! * Fredrik Nilsson <frednils@student.chalmers.se>
 //! * Date: March 03, 2017
 
+use core::cell::Cell;
 use kernel::utilities::cells::OptionalCell;
 use kernel::utilities::registers::interfaces::{Readable, Writeable};
 use kernel::utilities::registers::{register_bitfields, ReadOnly, ReadWrite, WriteOnly};
 use kernel::ErrorCode;
 
-use abacus_registers::process_register_block;
+use abacus_registers::{heliod, process_register_block};
 
 #[repr(C)]
 #[process_register_block(
     peripheral_name = "Nrf5xTemp",
     register_base_addr = 0x4000C000,
     states = [
-        (Off),
-        (Reading),
+        (Off, cost: temp_off),
+        (Reading, cost: temp_reading),
     ]
 )]
 struct RegisterBlock {
     /// Start temperature measurement
     /// Address: 0x000 - 0x004
-    #[RegAttributes([Off], StateChange(Reading, [Task::ENABLE::SET]))]
+    #[RegAttributes([Off], StateChange(Reading, [Task::ENABLE::SET]), cost = temp_start)]
     pub task_start: WriteOnly<u32, Task::Register>,
     /// Stop temperature measurement
     /// Address: 0x004 - 0x008
-    #[RegAttributes([Reading], StateChange(Off, [Task::ENABLE::SET]))]
+    #[RegAttributes([Reading], StateChange(Off, [Task::ENABLE::SET]), cost = temp_stop)]
     pub task_stop: WriteOnly<u32, Task::Register>,
     /// Reserved
     pub _reserved1: [u32; 62],
     /// Temperature measurement complete, data ready
     /// Address: 0x100 - 0x104
+    #[RegAttributes([Off, Reading], ReadWrite, cost = temp_event)]
     pub event_datardy: ReadWrite<u32, Event::Register>,
     /// Reserved
     // Note, `inten` register on nRF51 is ignored because it's not supported by nRF52
@@ -48,15 +50,17 @@ struct RegisterBlock {
     pub _reserved2: [u32; 128],
     /// Enable interrupt
     /// Address: 0x304 - 0x308
+    #[RegAttributes([Off], ReadWrite, cost = temp_interrupt_enable)]
     pub intenset: ReadWrite<u32, Intenset::Register>,
     /// Disable interrupt
     /// Address: 0x308 - 0x30c
+    #[RegAttributes([Reading], ReadWrite, cost = temp_interrupt_disable)]
     pub intenclr: ReadWrite<u32, Intenclr::Register>,
     /// Reserved
     pub _reserved3: [u32; 127],
     /// Temperature in °C (0.25° steps)
     /// Address: 0x508 - 0x50c
-    #[RegAttributes([Reading], ReadOnly)]
+    #[RegAttributes([Reading], ReadOnly, cost = temp_read)]
     pub temp: ReadOnly<u32, Temperature::Register>,
     /// Reserved
     pub _reserved4: [u32; 5],
@@ -118,72 +122,75 @@ register_bitfields! [u32,
     ]
 ];
 
+// Keep the checked register sequences small and explicit. The Tock callbacks
+// below provide the runtime scheduling; Heliod infers the peripheral state at
+// the boundaries of these operations.
+#[heliod(Nrf5xTempCost)]
+mod checked {
+    use super::*;
+
+    pub(super) fn start(registers: &Nrf5xTempRegisters) {
+        registers.intenset.write(Intenset::DATARDY::SET);
+        registers.event_datardy.write(Event::READY::CLEAR);
+        registers.into_reading();
+    }
+
+    pub(super) fn complete(registers: &Nrf5xTempRegisters) -> u32 {
+        registers.intenclr.write(Intenclr::DATARDY::SET);
+        let temperature = registers.temp.get();
+        registers.into_off();
+        temperature
+    }
+}
+
 pub struct Temp<'a> {
     client: OptionalCell<&'a dyn kernel::hil::sensors::TemperatureClient>,
-    registers: OptionalCell<Nrf5xTempStateEnum>,
+    registers: Nrf5xTempRegisters,
+    access: OptionalCell<()>,
+    pending: Cell<bool>,
 }
 
 impl<'a> Temp<'a> {
     pub fn new() -> Temp<'a> {
         Temp {
             client: OptionalCell::empty(),
-            registers: OptionalCell::new(Nrf5xTempStateEnum::Off(unsafe {
-                Nrf5xTempRegisters::new(0x4000C000)
-            })),
+            registers: unsafe { Nrf5xTempRegisters::new(0x4000C000) },
+            access: OptionalCell::new(()),
+            pending: Cell::new(false),
         }
     }
 
     /// Temperature interrupt handler -- 84 cycles total
     pub fn handle_interrupt(&self) {
-        self.registers.take().map(|state| {
-            match state {
-                Nrf5xTempStateEnum::Reading(reg) => {
-                    self.disable_interrupts(&reg);
+        let Some(()) = self.access.take() else {
+            return;
+        };
+        if !self.pending.replace(false) {
+            self.access.set(());
+            return;
+        }
 
-                    // get temperature
-                    // Result of temperature measurement in °C, 2's complement format, 0.25 °C steps
-                    let temp = (reg.temp.get() as i32 * 100) / 4;
-
-                    // stop measurement
-                    let reg_result = reg.into_off();
-
-                    // trigger callback with temperature
-                    self.client.map(|client| client.callback(Ok(temp)));
-
-                    // 24 instructions
-                    self.registers.set(reg_result.into());
-                }
-                Nrf5xTempStateEnum::Off(reg) => self.registers.set(reg.into()),
-            }
-        });
-    }
-
-    fn enable_interrupts<S: State>(&self, reg: &Nrf5xTempRegisters<S>) {
-        reg.intenset.write(Intenset::DATARDY::SET);
-    }
-
-    fn disable_interrupts<S: State>(&self, reg: &Nrf5xTempRegisters<S>) {
-        reg.intenclr.write(Intenclr::DATARDY::SET);
+        // Result of temperature measurement in °C, 2's complement format,
+        // with 0.25 °C steps.
+        let temperature = (checked::complete(&self.registers) as i32 * 100) / 4;
+        self.access.set(());
+        self.client.map(|client| client.callback(Ok(temperature)));
     }
 }
 
 impl<'a> kernel::hil::sensors::TemperatureDriver<'a> for Temp<'a> {
     fn read_temperature(&self) -> Result<(), ErrorCode> {
-        self.registers.take().map_or_else(
-            || Err(ErrorCode::BUSY),
-            |state| match state {
-                Nrf5xTempStateEnum::Off(reg) => {
-                    self.enable_interrupts(&reg);
-                    reg.event_datardy.write(Event::READY::CLEAR);
-                    self.registers.set(reg.into_reading().into());
-                    Ok(())
-                }
-                Nrf5xTempStateEnum::Reading(reg) => {
-                    self.registers.set(reg.into());
-                    Err(ErrorCode::ALREADY)
-                }
-            },
-        )
+        let Some(()) = self.access.take() else {
+            return Err(ErrorCode::BUSY);
+        };
+        if self.pending.replace(true) {
+            self.access.set(());
+            return Err(ErrorCode::ALREADY);
+        }
+
+        checked::start(&self.registers);
+        self.access.set(());
+        Ok(())
     }
 
     fn set_client(&self, client: &'a dyn kernel::hil::sensors::TemperatureClient) {

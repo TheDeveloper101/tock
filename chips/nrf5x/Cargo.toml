@@ -12,7 +12,7 @@ edition.workspace = true
 cortexm4f = { path = "../../arch/cortex-m4f"}
 kernel = { path = "../../kernel" }
 enum_primitive = { path = "../../libraries/enum_primitive" }
-abacus_registers = {package = "abacus-registers", version = "0.1.0"}
+abacus_registers = { package = "abacus-registers", path = "../../.." }
 
 [features]
 default = []
